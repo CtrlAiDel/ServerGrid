@@ -1,7 +1,7 @@
 /**
- * @name ServerGridSync
+ * @name ServerGrid
  * @author WeConnected
- * @version 4.5.0
+ * @version 4.8.0
  * @description Adds a Serv button that opens a full-page grid of your servers and folders. Drag and drop to organize, create folders, and move servers in and out of them.
  */
 
@@ -133,15 +133,16 @@ function buildSettingsBody(current, layout) {
 
 module.exports = class ServerGrid {
     constructor(meta) {
-        this.meta = meta || { name: "ServerGridSync", version: "4.5.0" };
+        this.meta = meta || { name: "ServerGrid", version: "4.8.0" };
         const N = this.meta.name;
         this.overlay = null;
         this.observer = null;
         this.raf = null;
         this.drag = null;
         this.menu = null;
-        this.settings = Object.assign({ rows: 6, size: 64, lineMode: "rows", sync: true }, BdApi.Data.load(N, SETTINGS_KEY) || {});
+        this.settings = Object.assign({ rows: 6, size: 64, lineMode: "one", sync: true }, BdApi.Data.load(N, SETTINGS_KEY) || {});
         this.settings.sync = true; // changes are always saved to your Discord sidebar
+        this.settings.lineMode = "one"; // same placement as the Discord sidebar: servers and folders mixed on one line
         this.openFolders = new Set(BdApi.Data.load(N, OPEN_KEY) || []);
         this.layout = [];
         this.localLayout = BdApi.Data.load(N, LAYOUT_KEY) || null;
@@ -183,6 +184,9 @@ module.exports = class ServerGrid {
         try { addREST(Webpack.getByKeys("getAPIBaseURL", "get")); } catch (e) {}
         try { addREST(Webpack.getModule((m) => m?.del && m?.post && m?.get && m?.patch && m?.put, { searchExports: true })); } catch (e) {}
         try { addREST(Webpack.getModule((m) => m?.del && m?.post && m?.get && m?.patch, { searchExports: true })); } catch (e) {}
+        try {
+            for (const m of Webpack.getModule((m) => m?.del && m?.post && m?.get && m?.patch, { first: false, searchExports: true }) || []) addREST(m);
+        } catch (e) {}
         const REST = RESTs[0] || null;
         this.S = {
             Sorted: Webpack.getStore?.("SortedGuildStore") ?? Webpack.getByKeys("getGuildFolders"),
@@ -498,40 +502,71 @@ module.exports = class ServerGrid {
     }
 
     // Discord's HTTP client answers with the JSON in `text` (body can be empty), so we read both
-    unwrap(res) {
+    async unwrap(res) {
+        const tryJSON = (v) => { try { const j = JSON.parse(v); return j && typeof j === "object" ? j : null; } catch (e) { return null; } };
         const b = res?.body;
-        if (b && typeof b === "object" && ("settings" in b || "message" in b || "out_of_date" in b)) return b;
-        for (const raw of [res?.text, typeof b === "string" ? b : null]) {
-            if (typeof raw === "string") { try { return JSON.parse(raw); } catch (e) {} }
+        const isBuf = (v) => v instanceof ArrayBuffer || ArrayBuffer.isView?.(v);
+        if (b && typeof b === "object" && !isBuf(b) && ("settings" in b || "message" in b || "out_of_date" in b)) return b;
+        const texts = [];
+        if (typeof res?.text === "string") texts.push(res.text);
+        if (typeof b === "string") texts.push(b);
+        let xr; try { xr = res?.xhr?.response; } catch (e) {}
+        if (typeof xr === "string") texts.push(xr);
+        for (const buf of [xr, b]) {
+            try {
+                if (isBuf(buf)) texts.push(new TextDecoder().decode(buf));
+                else if (typeof Blob !== "undefined" && buf instanceof Blob) texts.push(await buf.text());
+            } catch (e) {}
         }
+        for (const t of texts) { const j = tryJSON(t); if (j) return j; }
         return b ?? res;
+    }
+
+    // One readable line about a response (used when something doesn't look right)
+    peek(res) {
+        const h = res?.headers || res?.header || {};
+        const ct = h["content-type"] || h["Content-Type"] || "?";
+        let rt = "?"; try { rt = res?.xhr?.responseType || "text"; } catch (e) {}
+        const tx = typeof res?.text === "string" ? JSON.stringify(res.text.slice(0, 80)) : typeof res?.text;
+        const bd = res?.body == null ? String(res?.body) : typeof res.body === "object" ? "{" + Object.keys(res.body).slice(0, 6).join(",") + "}" : typeof res.body;
+        return `status ${res?.status ?? "?"}, type ${ct}, xhr ${rt}, text ${tx}, body ${bd}`;
+    }
+
+    // The real API address (the relative path alone ends up on the Discord web page, which answers with HTML)
+    apiBase() {
+        try {
+            const g = window.GLOBAL_ENV;
+            if (g?.API_ENDPOINT) {
+                const e = String(g.API_ENDPOINT);
+                return (e.startsWith("//") ? location.protocol + e : e) + "/v" + (g.API_VERSION || 9);
+            }
+        } catch (e) {}
+        return "https://discord.com/api/v9";
     }
 
     async readSettings() {
         const path = "/users/@me/settings-proto/1";
         const problems = [];
+        let best = null; // a connection that clearly reaches the API (even if it answered with an error)
         for (const REST of this.S.RESTs || []) {
-            const urls = [path];
-            try {
-                const base = REST.getAPIBaseURL?.();
-                if (base) urls.push((String(base).startsWith("//") ? "https:" + base : base) + path);
-            } catch (e) {}
-            for (const url of urls) {
+            for (const url of [this.apiBase() + path, path]) {
                 try {
                     const res = await REST.get({ url });
-                    const b = this.unwrap(res);
+                    const b = await this.unwrap(res);
                     if (b && typeof b.settings === "string") return { REST, url, settings: b.settings };
+                    if (b && typeof b === "object" && b !== res && !best) best = { REST, url };
                     console.warn("[ServerGrid] unexpected settings response", url, res);
-                    const ct = res?.headers?.["content-type"] || res?.header?.["content-type"] || "?";
-                    const txt = typeof res?.text === "string" ? JSON.stringify(res.text.slice(0, 60)) : typeof res?.text;
-                    problems.push(`${url.startsWith("http") ? "full url" : "path"}: status ${res?.status ?? "?"}, type ${ct}, text ${txt}`);
+                    problems.push(`${url.startsWith("http") ? "api url" : "path"}: ${this.peek(res)}`);
                 } catch (e) {
+                    if (!best && e?.status >= 400 && e?.status < 500) best = { REST, url };
                     console.warn("[ServerGrid] settings request failed", url, e);
-                    problems.push(this.describe(e));
+                    problems.push((url.startsWith("http") ? "api url: " : "path: ") + this.describe(e));
                 }
             }
         }
-        throw new Error("couldn't read your current settings (" + (problems.join(" | ") || "Discord's HTTP module wasn't found") + ")");
+        const err = new Error("couldn't read your current settings (" + (problems.join(" | ") || "Discord's HTTP module wasn't found") + ")");
+        err.best = best;
+        throw err;
     }
 
     validateLayout(layout) {
@@ -551,21 +586,24 @@ module.exports = class ServerGrid {
 
     async writeFolders(layout) {
         this.validateLayout(layout);
-        let REST, url = "/users/@me/settings-proto/1", current = new Uint8Array(0), readProblem = null;
+        let REST, url = this.apiBase() + "/users/@me/settings-proto/1", current = new Uint8Array(0), readProblem = null;
         try {
             const r = await this.readSettings();
             REST = r.REST; url = r.url; current = b64ToBytes(r.settings);
         } catch (e) {
             // Can't read the current settings: save the folders anyway (extras such as custom folder icons can't be kept)
             readProblem = e.message;
-            REST = (this.S.RESTs || [])[0];
+            REST = e.best?.REST || (this.S.RESTs || [])[0];
+            if (e.best?.url) url = e.best.url;
             if (!REST) throw e;
             console.warn("[ServerGrid] saving without reading your settings first:", e.message);
         }
         for (let attempt = 0; attempt < 2; attempt++) {
             let r;
             try {
-                r = this.unwrap(await REST.patch({ url, body: buildSettingsBody(current, layout) }));
+                const raw = await REST.patch({ url, body: buildSettingsBody(current, layout) });
+                this._lastWrite = { read: readProblem, save: this.peek(raw) };
+                r = await this.unwrap(raw);
             } catch (e) {
                 if (readProblem && e && typeof e === "object") e.readProblem = readProblem;
                 throw e;
@@ -584,9 +622,10 @@ module.exports = class ServerGrid {
         const reflected = () => this.sig(this.seedLayout()) === expected;
         if (this.pending && this.pending.sig === expected) this.pending.until = Date.now() + 10 * 60 * 1000;
         setTimeout(() => {
-            if (this.pending && this.pending.sig === expected && !reflected()) {
-                this.flash("Saved to Discord. If the sidebar doesn't change, reload Discord (Ctrl+R).");
-            }
+            if (!(this.pending && this.pending.sig === expected && !reflected())) return;
+            const w = this._lastWrite || {};
+            this.fail("Discord accepted the request but your sidebar didn't change. " +
+                `Reading your settings: ${w.read ? w.read : "ok"}. Saving: ${w.save || "no answer"}.`);
         }, 4000);
     }
 
@@ -1136,10 +1175,6 @@ module.exports = class ServerGrid {
             style: { padding: "8px 16px", borderRadius: 6, border: 0, cursor: "pointer", fontWeight: 700, background: "#ff5fb0", color: "#3a0023" }
         }, "Restore backup");
         const settings = [
-                { type: "dropdown", id: "lineMode", name: "Layout", value: this.settings.lineMode, options: [
-                    { label: "Folders on one line, servers on the next", value: "rows" },
-                    { label: "Everything on one line", value: "one" }
-                ] },
                 { type: "slider", id: "rows", name: "Servers per column in an open folder", note: "Beyond that, they overflow to the right.", value: this.settings.rows, min: 2, max: 20, step: 1, markers: [2, 4, 6, 8, 10, 12, 16, 20] },
                 { type: "slider", id: "size", name: "Icon size (px)", value: this.settings.size, min: 40, max: 120, step: 4, markers: [40, 56, 64, 80, 96, 120] }
         ];
