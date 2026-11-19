@@ -4,6 +4,10 @@
 **Version:** 5.0.0  
 **Platform:** BetterDiscord (Discord desktop) / Javelic0rd (Alternative Discord software)
 
+Demo:
+<img width="1919" height="1051" alt="image" src="https://github.com/user-attachments/assets/72a26bb9-ff7d-4a76-8807-e9486dd31199" />
+
+
 ## What it does
 
 ServList adds a **Serv List** button to your Discord sidebar (right under *Direct Messages*). It opens a full-page grid of every server and folder you have, in exactly the same order as your sidebar. Move things around on the page and your real sidebar follows.
