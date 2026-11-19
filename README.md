@@ -1,4 +1,4 @@
-# ServerGridSync
+# ServList
 
 **Author:** WeConnected  
 **Version:** 5.0.0  
